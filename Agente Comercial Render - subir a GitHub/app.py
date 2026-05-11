@@ -1,0 +1,1208 @@
+import json
+import os
+import csv
+import io
+import shutil
+import subprocess
+import sys
+import webbrowser
+import threading
+from datetime import datetime
+from flask import Flask, render_template, request, jsonify, redirect, send_file
+from collections import defaultdict
+
+RESOURCE_BASE = getattr(sys, '_MEIPASS', os.path.dirname(__file__))
+DEFAULT_DATA_DIR = os.path.join(RESOURCE_BASE, 'data')
+
+if os.environ.get('AGENTE_COMERCIAL_DATA_DIR') or getattr(sys, 'frozen', False):
+    fallback_data_dir = (
+        os.path.join(os.path.expanduser('~'), 'Library', 'Application Support', 'Agente Comercial', 'data')
+        if getattr(sys, 'frozen', False)
+        else DEFAULT_DATA_DIR
+    )
+    USER_DATA_DIR = os.environ.get('AGENTE_COMERCIAL_DATA_DIR', fallback_data_dir)
+    os.makedirs(USER_DATA_DIR, exist_ok=True)
+    for filename in ('kpis.json', 'facturas.csv', 'presupuestos.csv'):
+        source = os.path.join(DEFAULT_DATA_DIR, filename)
+        target = os.path.join(USER_DATA_DIR, filename)
+        if not os.path.exists(target):
+            shutil.copy2(source, target)
+    BASE = USER_DATA_DIR
+else:
+    BASE = os.path.dirname(__file__)
+
+app = Flask(
+    __name__,
+    template_folder=os.path.join(RESOURCE_BASE, 'templates'),
+    static_folder=os.path.join(RESOURCE_BASE, 'static')
+)
+USE_DATA_DIR = os.environ.get('AGENTE_COMERCIAL_DATA_DIR') or getattr(sys, 'frozen', False)
+DATA_FILE = os.path.join(BASE, 'kpis.json') if USE_DATA_DIR else os.path.join(BASE, 'data', 'kpis.json')
+FACTURAS_FILE = os.path.join(BASE, 'facturas.csv') if USE_DATA_DIR else os.path.join(BASE, 'data', 'facturas.csv')
+PRESUPUESTOS_FILE = os.path.join(BASE, 'presupuestos.csv') if USE_DATA_DIR else os.path.join(BASE, 'data', 'presupuestos.csv')
+APP_PORT = int(os.environ.get('PORT', os.environ.get('AGENTE_COMERCIAL_PORT', '8765')))
+
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+
+
+def load_kpis():
+    with open(DATA_FILE, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def save_kpis(data):
+    with open(DATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def parse_num(s):
+    try:
+        return float(str(s).replace('.', '').replace(',', '.'))
+    except:
+        return 0.0
+
+
+def load_csv(path):
+    with open(path, encoding='latin-1') as f:
+        content = f.read().replace('\r\n', '\n').replace('\r', '\n')
+    reader = csv.DictReader(io.StringIO(content), delimiter=';')
+    return list(reader)
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.route('/')
+def root():
+    return redirect('/ecom/kpiscomercial')
+
+
+@app.route('/ecom/kpiscomercial')
+def index():
+    return render_template('index.html')
+
+
+# ── KPIs ──────────────────────────────────────────────────────────────────────
+
+@app.route('/api/kpis', methods=['GET'])
+def get_kpis():
+    data = load_kpis()
+    equipo = request.args.get('equipo')
+    if equipo and equipo != 'Todos':
+        data['kpis'] = [k for k in data['kpis'] if k['equipo'] == equipo]
+    return jsonify(data)
+
+
+@app.route('/api/kpis', methods=['POST'])
+def create_kpi():
+    data = load_kpis()
+    nuevo = request.get_json()
+    nuevo['id'] = max((k['id'] for k in data['kpis']), default=0) + 1
+    nuevo['activo'] = True
+    data['kpis'].append(nuevo)
+    save_kpis(data)
+    return jsonify(nuevo), 201
+
+
+@app.route('/api/kpis/<int:kpi_id>', methods=['PUT'])
+def update_kpi(kpi_id):
+    data = load_kpis()
+    actualizado = request.get_json()
+    for i, k in enumerate(data['kpis']):
+        if k['id'] == kpi_id:
+            data['kpis'][i] = {**k, **actualizado, 'id': kpi_id}
+            save_kpis(data)
+            return jsonify(data['kpis'][i])
+    return jsonify({'error': 'KPI no encontrado'}), 404
+
+
+@app.route('/api/kpis/<int:kpi_id>', methods=['DELETE'])
+def delete_kpi(kpi_id):
+    data = load_kpis()
+    data['kpis'] = [k for k in data['kpis'] if k['id'] != kpi_id]
+    save_kpis(data)
+    return jsonify({'ok': True})
+
+
+# ── Presupuesto salarial ───────────────────────────────────────────────────────
+
+@app.route('/api/presupuesto', methods=['POST'])
+def calcular_presupuesto():
+    body = request.get_json()
+    presupuesto = body.get('presupuesto', 0)
+    kam_fijo = body.get('kam_fijo', 37500)
+    pm_fijo = body.get('pm_fijo', 27500)
+    num_kam = body.get('num_kam', 2)
+    num_pm = body.get('num_pm', 5)
+    kam_variable_pct = body.get('kam_variable_pct', 20)
+    pm_variable_pct = body.get('pm_variable_pct', 12)
+
+    kam_variable = kam_fijo * (kam_variable_pct / 100)
+    pm_variable = pm_fijo * (pm_variable_pct / 100)
+    coste_kam = num_kam * (kam_fijo + kam_variable)
+    coste_pm = num_pm * (pm_fijo + pm_variable)
+    coste_total = coste_kam + coste_pm
+    remanente = presupuesto - coste_total
+
+    return jsonify({
+        'kam': {'num': num_kam, 'fijo': kam_fijo, 'variable': round(kam_variable),
+                'total_persona': round(kam_fijo + kam_variable), 'coste_equipo': round(coste_kam)},
+        'pm': {'num': num_pm, 'fijo': pm_fijo, 'variable': round(pm_variable),
+               'total_persona': round(pm_fijo + pm_variable), 'coste_equipo': round(coste_pm)},
+        'coste_total': round(coste_total),
+        'remanente': round(remanente),
+        'pct_usado': round((coste_total / presupuesto) * 100, 1) if presupuesto else 0
+    })
+
+
+# ── Facturación ───────────────────────────────────────────────────────────────
+
+@app.route('/api/facturacion')
+def get_facturacion():
+    rows = load_csv(FACTURAS_FILE)
+    f_year = request.args.get('year', '')
+    f_month = request.args.get('month', '')
+
+    por_mes = defaultdict(float)
+    por_sector = defaultdict(float)
+    por_tipo = defaultdict(float)
+    por_cliente = defaultdict(float)
+    total = cobrado = pendiente = vencido = 0.0
+    years_set = set()
+    months_set = set()
+
+    year_totals = defaultdict(float)
+
+    for r in rows:
+        imp = parse_num(r.get('Importe total', 0))
+        if imp <= 0:
+            continue
+
+        fecha = r.get('Fecha de la factura', '').strip()
+        anyo = mes_num = ''
+        if len(fecha) >= 10:
+            anyo = fecha[6:10]
+            mes_num = fecha[3:5]
+            years_set.add(anyo)
+            months_set.add(f"{anyo}-{mes_num}")
+
+        if anyo:
+            year_totals[anyo] += imp
+
+        if f_year and anyo != f_year:
+            continue
+        if f_month and mes_num != f_month:
+            continue
+
+        pag = parse_num(r.get('Total pagado', 0))
+        pend = parse_num(r.get('Total Pendiente', 0))
+        venc = parse_num(r.get('Importe Actualmente Vencido', 0))
+
+        total += imp
+        cobrado += pag
+        pendiente += pend
+        vencido += venc
+
+        if anyo and mes_num:
+            por_mes[f"{anyo}-{mes_num}"] += imp
+
+        sector = r.get('Dimensi\xf3n 1', r.get('Dimensión 1', '')).strip() or 'Sin sector'
+        por_sector[sector] += imp
+
+        tipo = r.get('Dimensi\xf3n 2', r.get('Dimensión 2', '')).strip() or 'Sin tipo'
+        por_tipo[tipo] += imp
+
+        cliente = r.get('Tercero', '').strip()
+        if cliente:
+            por_cliente[cliente] += imp
+
+    top_clientes = sorted(por_cliente.items(), key=lambda x: -x[1])[:10]
+
+    return jsonify({
+        'resumen': {
+            'total': round(total),
+            'cobrado': round(cobrado),
+            'pendiente': round(pendiente),
+            'vencido': round(vencido),
+            'pct_cobrado': round(cobrado / total * 100, 1) if total else 0
+        },
+        'por_mes': dict(sorted(por_mes.items())),
+        'por_sector': dict(sorted(por_sector.items(), key=lambda x: -x[1])),
+        'por_tipo': dict(sorted(por_tipo.items(), key=lambda x: -x[1])),
+        'top_clientes': [{'cliente': k, 'importe': round(v)} for k, v in top_clientes],
+        'years': sorted(years_set),
+        'months_available': sorted(months_set),
+        'year_totals': {k: round(v) for k, v in sorted(year_totals.items())}
+    })
+
+
+# ── Pipeline de presupuestos ──────────────────────────────────────────────────
+
+@app.route('/api/pipeline')
+def get_pipeline():
+    rows = load_csv(PRESUPUESTOS_FILE)
+    f_year = request.args.get('year', '')
+    f_month = request.args.get('month', '')
+
+    por_estado = defaultdict(lambda: {'count': 0, 'importe': 0.0})
+    por_comercial = defaultdict(lambda: {'ganados': 0, 'perdidos': 0, 'pendientes': 0,
+                                          'importe_ganado': 0.0, 'importe_total': 0.0})
+    por_campanya = defaultdict(float)
+    years_set = set()
+    months_set = set()
+
+    for r in rows:
+        fecha = r.get('Fecha de presupuesto', '').strip()
+        anyo = mes_num = ''
+        if len(fecha) >= 10:
+            anyo = fecha[6:10]
+            mes_num = fecha[3:5]
+            years_set.add(anyo)
+            months_set.add(f"{anyo}-{mes_num}")
+
+        if f_year and anyo != f_year:
+            continue
+        if f_month and mes_num != f_month:
+            continue
+
+        imp = parse_num(r.get('Importe total', 0))
+        estado = r.get('Estado doc.', '').strip()
+        comercial = r.get('Creado por', '').strip() or 'Sin asignar'
+        campanya = r.get('Campa\xf1a', r.get('Campaña', '')).strip() or 'Sin campaña'
+
+        por_estado[estado]['count'] += 1
+        por_estado[estado]['importe'] += imp
+
+        por_comercial[comercial]['importe_total'] += imp
+        if estado == 'Cerrado - Pedido creado':
+            por_comercial[comercial]['ganados'] += 1
+            por_comercial[comercial]['importe_ganado'] += imp
+        elif estado == 'Cerrado - Rechazado':
+            por_comercial[comercial]['perdidos'] += 1
+        else:
+            por_comercial[comercial]['pendientes'] += 1
+
+        if imp > 0:
+            por_campanya[campanya] += imp
+
+    # Win rate global
+    ganados = por_estado.get('Cerrado - Pedido creado', {}).get('count', 0)
+    perdidos = por_estado.get('Cerrado - Rechazado', {}).get('count', 0)
+    cerrados = ganados + perdidos
+    win_rate = round(ganados / cerrados * 100, 1) if cerrados else 0
+
+    # Por comercial con win rate
+    comerciales_out = []
+    for nombre, d in sorted(por_comercial.items(), key=lambda x: -x[1]['importe_ganado']):
+        c = d['ganados'] + d['perdidos']
+        wr = round(d['ganados'] / c * 100, 1) if c else 0
+        comerciales_out.append({
+            'nombre': nombre,
+            'ganados': d['ganados'],
+            'perdidos': d['perdidos'],
+            'pendientes': d['pendientes'],
+            'win_rate': wr,
+            'importe_ganado': round(d['importe_ganado']),
+            'importe_total': round(d['importe_total'])
+        })
+
+    estados_out = {k: {'count': v['count'], 'importe': round(v['importe'])}
+                   for k, v in por_estado.items()}
+
+    top_campanya = sorted(por_campanya.items(), key=lambda x: -x[1])[:8]
+
+    return jsonify({
+        'win_rate_global': win_rate,
+        'total_ganado': round(por_estado.get('Cerrado - Pedido creado', {}).get('importe', 0)),
+        'total_perdido': round(por_estado.get('Cerrado - Rechazado', {}).get('importe', 0)),
+        'en_curso': round(
+            por_estado.get('Bajo evaluación', {}).get('importe', 0) +
+            por_estado.get('Borrador', {}).get('importe', 0)
+        ),
+        'por_estado': estados_out,
+        'por_comercial': comerciales_out,
+        'por_campanya': [{'campanya': k, 'importe': round(v)} for k, v in top_campanya],
+        'years': sorted(years_set),
+        'months_available': sorted(months_set)
+    })
+
+
+# ── Clientes ──────────────────────────────────────────────────────────────────
+
+@app.route('/api/clientes')
+def get_clientes():
+    rows = load_csv(FACTURAS_FILE)
+    clientes = {}
+    for r in rows:
+        cli = r.get('Tercero', '').strip()
+        imp = parse_num(r.get('Importe total', 0))
+        if cli and imp > 0:
+            clientes[cli] = clientes.get(cli, 0) + imp
+    ordenados = sorted(clientes.items(), key=lambda x: -x[1])
+    return jsonify([{'nombre': k, 'importe': round(v)} for k, v in ordenados])
+
+
+@app.route('/api/cliente')
+def get_cliente():
+    nombre = request.args.get('nombre', '').strip()
+    if not nombre:
+        return jsonify({'error': 'nombre requerido'}), 400
+
+    rows_f = load_csv(FACTURAS_FILE)
+    total_f = cobrado_f = pendiente_f = vencido_f = 0.0
+    por_mes = defaultdict(float)
+    por_sector = defaultdict(float)
+    por_tipo = defaultdict(float)
+    facturas = []
+
+    for r in rows_f:
+        if r.get('Tercero', '').strip() != nombre:
+            continue
+        imp  = parse_num(r.get('Importe total', 0))
+        if imp <= 0:
+            continue
+        pag  = parse_num(r.get('Total pagado', 0))
+        pend = parse_num(r.get('Total Pendiente', 0))
+        venc = parse_num(r.get('Importe Actualmente Vencido', 0))
+        total_f += imp; cobrado_f += pag; pendiente_f += pend; vencido_f += venc
+
+        fecha = r.get('Fecha de la factura', '').strip()
+        if len(fecha) >= 10:
+            por_mes[f"{fecha[6:10]}-{fecha[3:5]}"] += imp
+
+        sec  = r.get('Dimensi\xf3n 1', r.get('Dimensión 1', '')).strip() or 'Sin sector'
+        tipo = r.get('Dimensi\xf3n 2', r.get('Dimensión 2', '')).strip() or 'Sin tipo'
+        por_sector[sec]  += imp
+        por_tipo[tipo]   += imp
+
+        facturas.append({
+            'numero':    r.get('Número', r.get('Nº', r.get('Num.', ''))).strip(),
+            'fecha':     fecha,
+            'importe':   round(imp),
+            'cobrado':   round(pag),
+            'pendiente': round(pend),
+            'vencido':   round(venc),
+        })
+
+    facturas.sort(key=lambda x: x['fecha'], reverse=True)
+
+    rows_p = load_csv(PRESUPUESTOS_FILE)
+    pipe_ganado = pipe_perdido = pipe_curso = 0.0
+    count_g = count_p = count_c = 0
+    presupuestos = []
+
+    for r in rows_p:
+        cli = r.get('Tercero', r.get('Raz\xf3n social', r.get('Razón social', ''))).strip()
+        if cli != nombre:
+            continue
+        imp    = parse_num(r.get('Importe total', 0))
+        estado = r.get('Estado doc.', '').strip()
+        fecha  = r.get('Fecha de presupuesto', '').strip()
+
+        if estado == 'Cerrado - Pedido creado':
+            pipe_ganado += imp; count_g += 1
+        elif estado == 'Cerrado - Rechazado':
+            pipe_perdido += imp; count_p += 1
+        else:
+            pipe_curso += imp; count_c += 1
+
+        presupuestos.append({
+            'numero':  r.get('Número', r.get('Nº', '')).strip(),
+            'fecha':   fecha,
+            'importe': round(imp),
+            'estado':  estado,
+        })
+
+    presupuestos.sort(key=lambda x: x['fecha'], reverse=True)
+    cerrados = count_g + count_p
+    win_rate = round(count_g / cerrados * 100, 1) if cerrados else 0
+
+    return jsonify({
+        'nombre': nombre,
+        'facturacion': {
+            'total':      round(total_f),
+            'cobrado':    round(cobrado_f),
+            'pendiente':  round(pendiente_f),
+            'vencido':    round(vencido_f),
+            'pct_cobrado': round(cobrado_f / total_f * 100, 1) if total_f else 0,
+            'por_mes':    dict(sorted(por_mes.items())),
+            'por_sector': dict(sorted(por_sector.items(), key=lambda x: -x[1])),
+            'por_tipo':   dict(sorted(por_tipo.items(), key=lambda x: -x[1])),
+            'facturas':   facturas[:30],
+        },
+        'pipeline': {
+            'ganado':        round(pipe_ganado),
+            'perdido':       round(pipe_perdido),
+            'en_curso':      round(pipe_curso),
+            'win_rate':      win_rate,
+            'count_ganados': count_g,
+            'count_perdidos':count_p,
+            'count_curso':   count_c,
+            'presupuestos':  presupuestos[:30],
+        },
+    })
+
+
+# ── Comparativa global de clientes ───────────────────────────────────────────
+
+@app.route('/api/comparativa_clientes')
+def get_comparativa_clientes():
+    rows_f = load_csv(FACTURAS_FILE)
+    fac = defaultdict(lambda: defaultdict(float))
+    cob = defaultdict(lambda: defaultdict(float))
+
+    for r in rows_f:
+        cli = r.get('Tercero', '').strip()
+        imp = parse_num(r.get('Importe total', 0))
+        if not cli or imp <= 0:
+            continue
+        fecha = r.get('Fecha de la factura', '').strip()
+        anyo  = fecha[6:10] if len(fecha) >= 10 else ''
+        if anyo:
+            fac[cli][anyo] += imp
+            cob[cli][anyo] += parse_num(r.get('Total pagado', 0))
+
+    rows_p = load_csv(PRESUPUESTOS_FILE)
+    pipe = defaultdict(lambda: defaultdict(float))
+
+    for r in rows_p:
+        cli    = r.get('Tercero', r.get('Raz\xf3n social', r.get('Razón social', ''))).strip()
+        estado = r.get('Estado doc.', '').strip()
+        if not cli or estado != 'Cerrado - Pedido creado':
+            continue
+        imp   = parse_num(r.get('Importe total', 0))
+        fecha = r.get('Fecha de presupuesto', '').strip()
+        anyo  = fecha[6:10] if len(fecha) >= 10 else ''
+        if anyo:
+            pipe[cli][anyo] += imp
+
+    todos = set(fac.keys()) | set(pipe.keys())
+    resultado = []
+    for cli in todos:
+        f25 = fac[cli].get('2025', 0)
+        f26 = fac[cli].get('2026', 0)
+        p25 = pipe[cli].get('2025', 0)
+        p26 = pipe[cli].get('2026', 0)
+        if f25 + f26 + p25 + p26 == 0:
+            continue
+        var_f   = round(f26 - f25)
+        var_pct = round((f26 - f25) / f25 * 100, 1) if f25 else None
+        resultado.append({
+            'nombre':    cli,
+            'fac_2025':  round(f25),
+            'fac_2026':  round(f26),
+            'fac_var':   var_f,
+            'fac_pct':   var_pct,
+            'pipe_2025': round(p25),
+            'pipe_2026': round(p26),
+            'pipe_var':  round(p26 - p25),
+        })
+
+    resultado.sort(key=lambda x: -(x['fac_2025'] + x['fac_2026']))
+    return jsonify(resultado)
+
+
+# ── Informe Excel ────────────────────────────────────────────────────────────
+
+@app.route('/api/informe')
+def generar_informe():
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    fecha_hoy = datetime.now().strftime('%d/%m/%Y')
+    fecha_archivo = datetime.now().strftime('%Y%m%d_%H%M')
+
+    # ── Paleta de estilos ──────────────────────────────────────────────────────
+    negro    = '000000'
+    blanco   = 'FFFFFF'
+    gris1    = 'F7F7F7'
+    gris2    = 'E0E0E0'
+    verde    = '1A7A1A'
+    rojo     = 'C00000'
+    verde_bg = 'E6F4E6'
+    rojo_bg  = 'FCE8E8'
+    azul_bg  = 'EDEDFD'
+    mint_bg  = 'EDFDEE'
+    gold_bg  = 'FDFDED'
+
+    def pf(color): return PatternFill(fill_type='solid', fgColor=color)
+
+    fill_negro = pf(negro)
+    fill_gris1 = pf(gris1)
+    fill_gris2 = pf(gris2)
+    fill_verde = pf(verde_bg)
+    fill_rojo  = pf(rojo_bg)
+
+    borde_fino = Border(
+        left=Side(style='thin', color=negro),
+        right=Side(style='thin', color=negro),
+        top=Side(style='thin', color=negro),
+        bottom=Side(style='thin', color=negro)
+    )
+    borde_medio = Border(
+        left=Side(style='medium', color=negro),
+        right=Side(style='medium', color=negro),
+        top=Side(style='medium', color=negro),
+        bottom=Side(style='medium', color=negro)
+    )
+
+    def fnt(bold=False, size=10, color=negro, name='Calibri'):
+        return Font(bold=bold, size=size, color=color, name=name)
+
+    def aln(h='left', v='center', wrap=False):
+        return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+
+    def fmt_eur(v):
+        try: return f"{float(v):,.0f} €".replace(',', '.')
+        except: return '—'
+
+    def fmt_pct(v):
+        try: return f"{float(v):.1f}%"
+        except: return '—'
+
+    def set_col_width(ws, col, w):
+        ws.column_dimensions[get_column_letter(col)].width = w
+
+    def header_row(ws, row, cols, texts, fills=None, font_color=blanco):
+        for i, (col, text) in enumerate(zip(cols, texts)):
+            c = ws.cell(row=row, column=col, value=text)
+            c.font = fnt(bold=True, size=10, color=font_color)
+            c.fill = fills[i] if fills else fill_negro
+            c.alignment = aln('center')
+            c.border = borde_fino
+
+    def data_row(ws, row, cols, values, fill=None, bold=False, align='left'):
+        for col, val in zip(cols, values):
+            c = ws.cell(row=row, column=col, value=val)
+            c.font = fnt(bold=bold, size=10)
+            c.alignment = aln(align)
+            c.border = borde_fino
+            if fill: c.fill = fill
+
+    def titulo_seccion(ws, row, col_ini, col_fin, texto, merge=True):
+        if merge:
+            ws.merge_cells(start_row=row, start_column=col_ini,
+                           end_row=row, end_column=col_fin)
+        c = ws.cell(row=row, column=col_ini, value=texto)
+        c.font = fnt(bold=True, size=11, color=blanco)
+        c.fill = fill_negro
+        c.alignment = aln('left')
+        c.border = borde_medio
+        return row + 1
+
+    # ── Cargar datos ───────────────────────────────────────────────────────────
+    # Facturación completa
+    rows_f = load_csv(FACTURAS_FILE)
+    por_mes_f   = defaultdict(float)
+    por_sector  = defaultdict(float)
+    por_tipo    = defaultdict(float)
+    por_cliente = defaultdict(float)
+    total_f = cobrado_f = pendiente_f = vencido_f = 0.0
+    f25 = f26 = 0.0
+
+    for r in rows_f:
+        imp  = parse_num(r.get('Importe total', 0))
+        if imp <= 0: continue
+        pag  = parse_num(r.get('Total pagado', 0))
+        pend = parse_num(r.get('Total Pendiente', 0))
+        venc = parse_num(r.get('Importe Actualmente Vencido', 0))
+        total_f += imp; cobrado_f += pag; pendiente_f += pend; vencido_f += venc
+        fecha = r.get('Fecha de la factura', '').strip()
+        if len(fecha) >= 10:
+            anyo    = fecha[6:10]
+            mes_num = fecha[3:5]
+            por_mes_f[f"{anyo}-{mes_num}"] += imp
+            if anyo == '2025': f25 += imp
+            if anyo == '2026': f26 += imp
+        sec  = r.get('Dimensi\xf3n 1', '').strip() or 'Sin sector'
+        tipo = r.get('Dimensi\xf3n 2', '').strip() or 'Sin tipo'
+        cli  = r.get('Tercero', '').strip()
+        por_sector[sec]   += imp
+        por_tipo[tipo]    += imp
+        if cli: por_cliente[cli] += imp
+
+    top_clientes = sorted(por_cliente.items(), key=lambda x: -x[1])[:15]
+
+    # Pipeline completo
+    rows_p = load_csv(PRESUPUESTOS_FILE)
+    por_estado    = defaultdict(lambda: {'count': 0, 'importe': 0.0})
+    por_comercial = defaultdict(lambda: {'ganados': 0, 'perdidos': 0, 'pendientes': 0,
+                                          'importe_ganado': 0.0})
+    p25_gan = p26_gan = p25_tot = p26_tot = 0.0
+    p25_g_count = p26_g_count = p25_c = p26_c = 0
+
+    for r in rows_p:
+        imp    = parse_num(r.get('Importe total', 0))
+        estado = r.get('Estado doc.', '').strip()
+        com    = r.get('Creado por', '').strip() or 'Sin asignar'
+        fecha  = r.get('Fecha de presupuesto', '').strip()
+        anyo   = fecha[6:10] if len(fecha) >= 10 else ''
+
+        por_estado[estado]['count'] += 1
+        por_estado[estado]['importe'] += imp
+        por_comercial[com]['importe_ganado'] += imp if estado == 'Cerrado - Pedido creado' else 0
+
+        if estado == 'Cerrado - Pedido creado':
+            por_comercial[com]['ganados'] += 1
+            if anyo == '2025': p25_gan += imp; p25_g_count += 1
+            if anyo == '2026': p26_gan += imp; p26_g_count += 1
+        elif estado == 'Cerrado - Rechazado':
+            por_comercial[com]['perdidos'] += 1
+        else:
+            por_comercial[com]['pendientes'] += 1
+
+        if anyo == '2025': p25_tot += imp; p25_c += 1
+        if anyo == '2026': p26_tot += imp; p26_c += 1
+
+    ganados_tot  = por_estado.get('Cerrado - Pedido creado', {}).get('count', 0)
+    perdidos_tot = por_estado.get('Cerrado - Rechazado', {}).get('count', 0)
+    cerrados_tot = ganados_tot + perdidos_tot
+    wr_global = round(ganados_tot / cerrados_tot * 100, 1) if cerrados_tot else 0
+
+    # KPIs
+    kpis_data = load_kpis()['kpis']
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # HOJA 1 — RESUMEN EJECUTIVO
+    # ══════════════════════════════════════════════════════════════════════════
+    ws1 = wb.active
+    ws1.title = '1. Resumen Ejecutivo'
+    ws1.sheet_view.showGridLines = False
+
+    # Cabecera principal
+    ws1.merge_cells('A1:H1')
+    c = ws1['A1']
+    c.value = 'INSTORE · CUADRO DE MANDO COMERCIAL'
+    c.font = fnt(bold=True, size=16, color=blanco)
+    c.fill = fill_negro
+    c.alignment = aln('center')
+    c.border = borde_medio
+    ws1.row_dimensions[1].height = 36
+
+    ws1.merge_cells('A2:H2')
+    c = ws1['A2']
+    c.value = f'Informe para Consejo de Dirección · Datos: Enero 2025 – Abril 2026 · Generado: {fecha_hoy}'
+    c.font = fnt(size=10, color='00888888')
+    c.alignment = aln('center')
+    ws1.row_dimensions[2].height = 18
+
+    # ── Bloque facturación ─────────────────────────────────────────────────────
+    r = 4
+    r = titulo_seccion(ws1, r, 1, 8, '  FACTURACIÓN GLOBAL')
+    header_row(ws1, r, [1,2,3,4,5,6,7,8],
+               ['Concepto','Total período','2025','2026','Variación €','Variación %','% Cobrado','Estado'],
+               font_color=blanco)
+    r += 1
+
+    variacion_f  = f26 - f25
+    pct_var_f    = (variacion_f / f25 * 100) if f25 else 0
+
+    filas_fact = [
+        ('Facturación total',  total_f,    f25,   f26,   f26-f25,          ((f26-f25)/f25*100) if f25 else 0, None, ''),
+        ('Cobrado',           cobrado_f,   None,  None,  None,              None,  (cobrado_f/total_f*100) if total_f else 0, '✓ Al día' if cobrado_f/total_f > 0.85 else '⚠ Revisar'),
+        ('Pendiente de cobro',pendiente_f, None,  None,  None,              None,  None, '⚠ Pendiente' if pendiente_f > 0 else ''),
+        ('Importe vencido',   vencido_f,   None,  None,  None,              None,  None, '🔴 Urgente' if vencido_f > 0 else '✓'),
+    ]
+
+    for fila in filas_fact:
+        concepto, total, a25, a26, var, var_pct, pct_cob, estado = fila
+        vals = [
+            concepto,
+            fmt_eur(total),
+            fmt_eur(a25) if a25 is not None else '—',
+            fmt_eur(a26) if a26 is not None else '—',
+            fmt_eur(var) if var is not None else '—',
+            fmt_pct(var_pct) if var_pct is not None else '—',
+            fmt_pct(pct_cob) if pct_cob is not None else '—',
+            estado
+        ]
+        data_row(ws1, r, [1,2,3,4,5,6,7,8], vals)
+
+        # Color variación
+        if var is not None:
+            c5 = ws1.cell(r, 5)
+            c6 = ws1.cell(r, 6)
+            if var > 0:
+                c5.fill = fill_verde; c5.font = fnt(bold=True, color=verde)
+                c6.fill = fill_verde; c6.font = fnt(bold=True, color=verde)
+            elif var < 0:
+                c5.fill = fill_rojo;  c5.font = fnt(bold=True, color=rojo)
+                c6.fill = fill_rojo;  c6.font = fnt(bold=True, color=rojo)
+        r += 1
+
+    r += 1
+    # ── Bloque pipeline ────────────────────────────────────────────────────────
+    r = titulo_seccion(ws1, r, 1, 8, '  PIPELINE COMERCIAL')
+    header_row(ws1, r, [1,2,3,4,5,6,7,8],
+               ['Concepto','Total período','2025','2026','Variación €','Variación %','',''],
+               font_color=blanco)
+    r += 1
+
+    wr25 = round(p25_g_count / max(p25_c,1) * 100, 1)
+    wr26 = round(p26_g_count / max(p26_c,1) * 100, 1)
+
+    filas_pipe = [
+        ('Presupuestos ganados (€)', p25_gan+p26_gan, p25_gan, p26_gan, p26_gan-p25_gan, ((p26_gan-p25_gan)/p25_gan*100) if p25_gan else 0),
+        ('Win Rate (%)',             wr_global,        wr25,    wr26,    wr26-wr25,       wr26-wr25),
+        ('Nº presupuestos ganados',  ganados_tot,      p25_g_count, p26_g_count, p26_g_count-p25_g_count, ((p26_g_count-p25_g_count)/p25_g_count*100) if p25_g_count else 0),
+        ('Nº presupuestos perdidos', perdidos_tot,     None,    None,    None,            None),
+    ]
+
+    for fila in filas_pipe:
+        concepto, total, a25, a26, var, var_pct = fila
+        is_pct = 'Rate' in concepto or '%' in concepto or 'Nº' in concepto
+        vals = [
+            concepto,
+            fmt_pct(total) if 'Rate' in concepto or '%' in concepto else str(int(total)) if 'Nº' in concepto else fmt_eur(total),
+            (fmt_pct(a25) if 'Rate' in concepto else str(int(a25)) if 'Nº' in concepto else fmt_eur(a25)) if a25 is not None else '—',
+            (fmt_pct(a26) if 'Rate' in concepto else str(int(a26)) if 'Nº' in concepto else fmt_eur(a26)) if a26 is not None else '—',
+            (f"+{var:.1f}%" if var > 0 else f"{var:.1f}%") if var is not None and ('Rate' in concepto or 'Nº' in concepto) else (fmt_eur(var) if var is not None else '—'),
+            fmt_pct(var_pct) if var_pct is not None else '—',
+            '', ''
+        ]
+        data_row(ws1, r, [1,2,3,4,5,6,7,8], vals)
+        if var is not None:
+            c5 = ws1.cell(r, 5); c6 = ws1.cell(r, 6)
+            if var > 0:
+                c5.fill = fill_verde; c5.font = fnt(bold=True, color=verde)
+                c6.fill = fill_verde; c6.font = fnt(bold=True, color=verde)
+            elif var < 0:
+                c5.fill = fill_rojo;  c5.font = fnt(bold=True, color=rojo)
+                c6.fill = fill_rojo;  c6.font = fnt(bold=True, color=rojo)
+        r += 1
+
+    # Anchos columna hoja 1
+    for col, w in [(1,28),(2,16),(3,14),(4,14),(5,14),(6,12),(7,12),(8,16)]:
+        set_col_width(ws1, col, w)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # HOJA 2 — FACTURACIÓN DETALLADA
+    # ══════════════════════════════════════════════════════════════════════════
+    ws2 = wb.create_sheet('2. Facturación')
+    ws2.sheet_view.showGridLines = False
+    ws2.merge_cells('A1:F1')
+    c = ws2['A1']; c.value = 'FACTURACIÓN DETALLADA · Enero 2025 – Abril 2026'
+    c.font = fnt(bold=True, size=13, color=blanco); c.fill = fill_negro
+    c.alignment = aln('center'); c.border = borde_medio
+    ws2.row_dimensions[1].height = 28
+
+    # Evolución mensual
+    r = 3
+    r = titulo_seccion(ws2, r, 1, 3, '  EVOLUCIÓN MENSUAL DE FACTURACIÓN')
+    header_row(ws2, r, [1,2,3], ['Mes', 'Importe (€)', '% s/total'], font_color=blanco)
+    r += 1
+    total_mes = sum(por_mes_f.values())
+    for k in sorted(por_mes_f):
+        v = por_mes_f[k]
+        anyo, mes = k.split('-')
+        MESES_ES = {'01':'Enero','02':'Febrero','03':'Marzo','04':'Abril','05':'Mayo',
+                    '06':'Junio','07':'Julio','08':'Agosto','09':'Septiembre',
+                    '10':'Octubre','11':'Noviembre','12':'Diciembre'}
+        label = f"{MESES_ES.get(mes, mes)} {anyo}"
+        fill_alt = fill_gris1 if r % 2 == 0 else None
+        data_row(ws2, r, [1,2,3], [label, fmt_eur(v), fmt_pct(v/total_mes*100)], fill=fill_alt)
+        # Barra visual en col 4
+        barra = '█' * int(v / total_mes * 30)
+        c4 = ws2.cell(r, 4, barra)
+        c4.font = Font(color='00AAAAAA', size=8)
+        r += 1
+
+    # Fila total
+    ws2.cell(r, 1, 'TOTAL').font = fnt(bold=True)
+    ws2.cell(r, 2, fmt_eur(total_mes)).font = fnt(bold=True)
+    ws2.cell(r, 3, '100%').font = fnt(bold=True)
+    for col in [1,2,3]:
+        ws2.cell(r, col).fill = fill_gris2
+        ws2.cell(r, col).border = borde_fino
+    r += 2
+
+    # Por sector
+    r = titulo_seccion(ws2, r, 1, 3, '  POR SECTOR')
+    header_row(ws2, r, [1,2,3], ['Sector', 'Importe (€)', '% s/total'], font_color=blanco)
+    r += 1
+    total_sec = sum(por_sector.values())
+    for k, v in sorted(por_sector.items(), key=lambda x: -x[1]):
+        fill_alt = fill_gris1 if r % 2 == 0 else None
+        data_row(ws2, r, [1,2,3], [k, fmt_eur(v), fmt_pct(v/total_sec*100)], fill=fill_alt)
+        r += 1
+
+    r += 1
+    # Por tipo de trabajo
+    r = titulo_seccion(ws2, r, 1, 3, '  POR TIPO DE TRABAJO')
+    header_row(ws2, r, [1,2,3], ['Tipo', 'Importe (€)', '% s/total'], font_color=blanco)
+    r += 1
+    total_tipo = sum(por_tipo.values())
+    for k, v in sorted(por_tipo.items(), key=lambda x: -x[1]):
+        fill_alt = fill_gris1 if r % 2 == 0 else None
+        data_row(ws2, r, [1,2,3], [k, fmt_eur(v), fmt_pct(v/total_tipo*100)], fill=fill_alt)
+        r += 1
+
+    for col, w in [(1,22),(2,16),(3,12),(4,32)]:
+        set_col_width(ws2, col, w)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # HOJA 3 — TOP CLIENTES
+    # ══════════════════════════════════════════════════════════════════════════
+    ws3 = wb.create_sheet('3. Top Clientes')
+    ws3.sheet_view.showGridLines = False
+    ws3.merge_cells('A1:E1')
+    c = ws3['A1']; c.value = 'TOP CLIENTES POR FACTURACIÓN · Enero 2025 – Abril 2026'
+    c.font = fnt(bold=True, size=13, color=blanco); c.fill = fill_negro
+    c.alignment = aln('center'); c.border = borde_medio
+    ws3.row_dimensions[1].height = 28
+
+    r = 3
+    header_row(ws3, r, [1,2,3,4,5],
+               ['#', 'Cliente', 'Facturación (€)', '% s/total', 'Peso relativo'],
+               font_color=blanco)
+    r += 1
+    total_cli = sum(v for _, v in top_clientes)
+    for i, (cli, v) in enumerate(top_clientes, 1):
+        pct_cli = v / total_f * 100
+        barra = '█' * int(pct_cli * 2)
+        fill_alt = fill_gris1 if r % 2 == 0 else None
+        data_row(ws3, r, [1,2,3,4,5],
+                 [i, cli, fmt_eur(v), fmt_pct(pct_cli), barra], fill=fill_alt)
+        ws3.cell(r, 5).font = Font(color='00000000', size=8)
+        r += 1
+
+    for col, w in [(1,4),(2,38),(3,18),(4,10),(5,28)]:
+        set_col_width(ws3, col, w)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # HOJA 4 — PIPELINE Y COMERCIALES
+    # ══════════════════════════════════════════════════════════════════════════
+    ws4 = wb.create_sheet('4. Pipeline y Equipo')
+    ws4.sheet_view.showGridLines = False
+    ws4.merge_cells('A1:G1')
+    c = ws4['A1']; c.value = 'PIPELINE COMERCIAL · Enero 2025 – Mayo 2026'
+    c.font = fnt(bold=True, size=13, color=blanco); c.fill = fill_negro
+    c.alignment = aln('center'); c.border = borde_medio
+    ws4.row_dimensions[1].height = 28
+
+    # Estado pipeline
+    r = 3
+    r = titulo_seccion(ws4, r, 1, 4, '  ESTADO DEL PIPELINE')
+    header_row(ws4, r, [1,2,3,4], ['Estado', 'Nº presupuestos', 'Importe (€)', '% s/total'], font_color=blanco)
+    r += 1
+    total_count_p = sum(v['count'] for v in por_estado.values())
+    total_imp_p   = sum(v['importe'] for v in por_estado.values())
+    orden_estado  = ['Cerrado - Pedido creado','Cerrado - Rechazado','Bajo evaluación','Borrador']
+    for k in orden_estado:
+        if k not in por_estado: continue
+        v = por_estado[k]
+        fill_e = fill_verde if k == 'Cerrado - Pedido creado' else fill_rojo if k == 'Cerrado - Rechazado' else None
+        data_row(ws4, r, [1,2,3,4],
+                 [k, v['count'], fmt_eur(v['importe']), fmt_pct(v['count']/total_count_p*100)],
+                 fill=fill_e)
+        r += 1
+
+    # Fila total pipeline
+    data_row(ws4, r, [1,2,3,4],
+             ['TOTAL', total_count_p, fmt_eur(total_imp_p), '100%'],
+             fill=fill_gris2, bold=True)
+    r += 2
+
+    # Win rate por comercial
+    r = titulo_seccion(ws4, r, 1, 7, '  WIN RATE POR COMERCIAL')
+    header_row(ws4, r, [1,2,3,4,5,6,7],
+               ['Comercial', 'Ganados', 'Perdidos', 'Pend.', 'Win Rate', 'Imp. ganado (€)', 'Ranking'],
+               font_color=blanco)
+    r += 1
+
+    com_sorted = sorted(por_comercial.items(), key=lambda x: -x[1]['importe_ganado'])
+    for rank, (nombre, d) in enumerate(com_sorted, 1):
+        cerrados = d['ganados'] + d['perdidos']
+        wr = round(d['ganados'] / cerrados * 100, 1) if cerrados else 0
+        fill_wr = fill_verde if wr >= 65 else fill_rojo if wr < 50 else None
+        data_row(ws4, r, [1,2,3,4,5,6,7],
+                 [nombre, d['ganados'], d['perdidos'], d['pendientes'],
+                  fmt_pct(wr), fmt_eur(d['importe_ganado']), f'#{rank}'])
+        if fill_wr is not None:
+            ws4.cell(r, 5).fill = fill_wr
+        ws4.cell(r, 5).font = fnt(bold=True, color=verde if wr >= 65 else rojo if wr < 50 else negro)
+        ws4.cell(r, 2).font = fnt(bold=True, color=verde)
+        ws4.cell(r, 3).font = fnt(color=rojo)
+        r += 1
+
+    for col, w in [(1,22),(2,10),(3,10),(4,8),(5,12),(6,18),(7,10)]:
+        set_col_width(ws4, col, w)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # HOJA 5 — KPIs DEL EQUIPO
+    # ══════════════════════════════════════════════════════════════════════════
+    ws5 = wb.create_sheet('5. KPIs Equipo')
+    ws5.sheet_view.showGridLines = False
+    ws5.merge_cells('A1:H1')
+    c = ws5['A1']; c.value = 'KPIs DEL EQUIPO COMERCIAL'
+    c.font = fnt(bold=True, size=13, color=blanco); c.fill = fill_negro
+    c.alignment = aln('center'); c.border = borde_medio
+    ws5.row_dimensions[1].height = 28
+
+    r = 3
+    header_row(ws5, r, [1,2,3,4,5,6,7,8],
+               ['KPI', 'Equipo', 'Descripción', 'Fórmula', 'Unidad', 'Mínimo', 'Objetivo', 'Excelente'],
+               font_color=blanco)
+    r += 1
+
+    for kpi in kpis_data:
+        eq = kpi.get('equipo','')
+        fill_eq = pf(azul_bg) if eq == 'KAM' else pf(mint_bg) if eq == 'PM' else pf(gold_bg)
+        data_row(ws5, r, [1,2,3,4,5,6,7,8], [
+            kpi.get('nombre',''),
+            eq,
+            kpi.get('descripcion',''),
+            kpi.get('formula',''),
+            kpi.get('unidad',''),
+            kpi.get('minimo',''),
+            kpi.get('objetivo',''),
+            kpi.get('excelente','')
+        ], fill=fill_eq)
+        ws5.cell(r, 1).font = fnt(bold=True)
+        ws5.cell(r, 2).alignment = aln('center')
+        ws5.cell(r, 3).alignment = aln('left', wrap=True)
+        r += 1
+
+    for col, w in [(1,28),(2,10),(3,40),(4,36),(5,10),(6,10),(7,10),(8,10)]:
+        set_col_width(ws5, col, w)
+    for rr in range(4, r):
+        ws5.row_dimensions[rr].height = 32
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # HOJA 6 — COMPARATIVA ANUAL 2025 vs 2026
+    # ══════════════════════════════════════════════════════════════════════════
+    ws6 = wb.create_sheet('6. Comparativa Anual')
+    ws6.sheet_view.showGridLines = False
+    ws6.merge_cells('A1:F1')
+    c = ws6['A1']; c.value = 'COMPARATIVA ANUAL 2025 vs 2026'
+    c.font = fnt(bold=True, size=13, color=blanco); c.fill = fill_negro
+    c.alignment = aln('center'); c.border = borde_medio
+    ws6.row_dimensions[1].height = 28
+
+    # ── Facturación por año ────────────────────────────────────────────────────
+    r = 3
+    r = titulo_seccion(ws6, r, 1, 6, '  FACTURACIÓN POR AÑO')
+    header_row(ws6, r, [1,2,3,4,5,6],
+               ['Métrica','2025','2026','Variación €','Variación %','Referencia'],
+               font_color=blanco)
+    r += 1
+
+    fac_por_anyo = defaultdict(lambda: {'total':0.0,'cobrado':0.0,'pendiente':0.0,'vencido':0.0})
+    for rr in rows_f:
+        imp  = parse_num(rr.get('Importe total', 0))
+        if imp <= 0: continue
+        fecha = rr.get('Fecha de la factura', '').strip()
+        anyo  = fecha[6:10] if len(fecha) >= 10 else ''
+        if anyo not in ('2025','2026'): continue
+        fac_por_anyo[anyo]['total']     += imp
+        fac_por_anyo[anyo]['cobrado']   += parse_num(rr.get('Total pagado', 0))
+        fac_por_anyo[anyo]['pendiente'] += parse_num(rr.get('Total Pendiente', 0))
+        fac_por_anyo[anyo]['vencido']   += parse_num(rr.get('Importe Actualmente Vencido', 0))
+
+    metricas_fac = [
+        ('Facturación total', 'total'),
+        ('Cobrado',           'cobrado'),
+        ('Pendiente',         'pendiente'),
+        ('Vencido',           'vencido'),
+    ]
+    for label, key in metricas_fac:
+        v25 = fac_por_anyo['2025'][key]
+        v26 = fac_por_anyo['2026'][key]
+        var = v26 - v25
+        pct = (var / v25 * 100) if v25 else 0
+        inv = key in ('pendiente', 'vencido')
+        bueno = (var < 0) if inv else (var > 0)
+        fill_v = fill_verde if bueno else fill_rojo if var != 0 else None
+        f_color = verde if bueno else rojo if var != 0 else negro
+        ref = ('✓ Mejora' if bueno else '⚠ Peor') if var != 0 else '= Sin cambio'
+        data_row(ws6, r, [1,2,3,4,5,6],
+                 [label, fmt_eur(v25), fmt_eur(v26), fmt_eur(var), fmt_pct(pct), ref])
+        c4 = ws6.cell(r, 4); c5 = ws6.cell(r, 5); c6 = ws6.cell(r, 6)
+        if fill_v:
+            c4.fill = fill_v; c5.fill = fill_v; c6.fill = fill_v
+        c4.font = fnt(bold=True, color=f_color)
+        c5.font = fnt(bold=True, color=f_color)
+        c6.font = fnt(bold=True, color=f_color)
+        r += 1
+
+    r += 1
+    # ── Facturación mes a mes ──────────────────────────────────────────────────
+    r = titulo_seccion(ws6, r, 1, 6, '  FACTURACIÓN MES A MES (2025 vs 2026)')
+    header_row(ws6, r, [1,2,3,4,5,6],
+               ['Mes', '2025', '2026', 'Variación €', 'Variación %', 'Tendencia'],
+               font_color=blanco)
+    r += 1
+
+    meses_es = {'01':'Enero','02':'Febrero','03':'Marzo','04':'Abril','05':'Mayo',
+                '06':'Junio','07':'Julio','08':'Agosto','09':'Septiembre',
+                '10':'Octubre','11':'Noviembre','12':'Diciembre'}
+    meses_comunes = sorted(set(k[5:] for k in por_mes_f.keys()))
+    for mes in meses_comunes:
+        v25 = por_mes_f.get(f'2025-{mes}', 0)
+        v26 = por_mes_f.get(f'2026-{mes}', 0)
+        if v25 + v26 == 0: continue
+        var = v26 - v25
+        pct = (var / v25 * 100) if v25 else 0
+        fill_m = fill_verde if var > 0 else fill_rojo if var < 0 else None
+        f_color_m = verde if var > 0 else rojo if var < 0 else negro
+        tend = '▲ +' + fmt_pct(pct) if var > 0 else '▼ ' + fmt_pct(pct) if var < 0 else '= Sin cambio'
+        fill_alt = fill_gris1 if r % 2 == 0 else None
+        data_row(ws6, r, [1,2,3,4,5,6],
+                 [meses_es.get(mes, mes), fmt_eur(v25), fmt_eur(v26), fmt_eur(var), fmt_pct(pct), tend],
+                 fill=fill_alt)
+        c4 = ws6.cell(r, 4); c5 = ws6.cell(r, 5); c6 = ws6.cell(r, 6)
+        if fill_m:
+            c4.fill = fill_m; c5.fill = fill_m; c6.fill = fill_m
+        c4.font = fnt(bold=True, color=f_color_m)
+        c5.font = fnt(bold=True, color=f_color_m)
+        c6.font = fnt(bold=True, color=f_color_m)
+        r += 1
+
+    r += 1
+    # ── Pipeline por año ───────────────────────────────────────────────────────
+    r = titulo_seccion(ws6, r, 1, 6, '  PIPELINE GANADO POR AÑO')
+    header_row(ws6, r, [1,2,3,4,5,6],
+               ['Métrica','2025','2026','Variación','Var %','Referencia'],
+               font_color=blanco)
+    r += 1
+
+    pipe_anyo = defaultdict(lambda: {'ganado':0.0,'perdido':0.0,'count_g':0,'count_p':0})
+    for rr in rows_p:
+        estado = rr.get('Estado doc.', '').strip()
+        imp    = parse_num(rr.get('Importe total', 0))
+        fecha  = rr.get('Fecha de presupuesto', '').strip()
+        anyo   = fecha[6:10] if len(fecha) >= 10 else ''
+        if anyo not in ('2025','2026'): continue
+        if estado == 'Cerrado - Pedido creado':
+            pipe_anyo[anyo]['ganado']   += imp
+            pipe_anyo[anyo]['count_g']  += 1
+        elif estado == 'Cerrado - Rechazado':
+            pipe_anyo[anyo]['perdido']  += imp
+            pipe_anyo[anyo]['count_p']  += 1
+
+    metricas_pipe = [
+        ('Importe ganado (€)', 'ganado', False),
+        ('Importe perdido (€)','perdido', True),
+        ('Nº presup. ganados', 'count_g', False),
+        ('Nº presup. perdidos','count_p', True),
+    ]
+    for label, key, inv in metricas_pipe:
+        v25 = pipe_anyo['2025'][key]
+        v26 = pipe_anyo['2026'][key]
+        var = v26 - v25
+        pct = (var / v25 * 100) if v25 else 0
+        bueno = (var < 0) if inv else (var > 0)
+        fill_v = fill_verde if bueno and var != 0 else fill_rojo if not bueno and var != 0 else None
+        f_color = verde if bueno and var != 0 else rojo if not bueno and var != 0 else negro
+        ref = ('✓ Mejora' if bueno else '⚠ Peor') if var != 0 else '= Sin cambio'
+        es_eur = key in ('ganado','perdido')
+        data_row(ws6, r, [1,2,3,4,5,6], [
+            label,
+            fmt_eur(v25) if es_eur else str(int(v25)),
+            fmt_eur(v26) if es_eur else str(int(v26)),
+            fmt_eur(var) if es_eur else ('+' if var > 0 else '') + str(int(var)),
+            fmt_pct(pct), ref
+        ])
+        c4 = ws6.cell(r, 4); c5 = ws6.cell(r, 5); c6 = ws6.cell(r, 6)
+        if fill_v:
+            c4.fill = fill_v; c5.fill = fill_v; c6.fill = fill_v
+        c4.font = fnt(bold=True, color=f_color)
+        c5.font = fnt(bold=True, color=f_color)
+        c6.font = fnt(bold=True, color=f_color)
+        r += 1
+
+    for col, w in [(1,24),(2,16),(3,16),(4,14),(5,12),(6,14)]:
+        set_col_width(ws6, col, w)
+
+    # ── Guardar ────────────────────────────────────────────────────────────────
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+
+    nombre_archivo = f'INSTORE_Informe_Consejo_{fecha_archivo}.xlsx'
+    return send_file(
+        output,
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        as_attachment=True,
+        download_name=nombre_archivo
+    )
+
+
+# ── Chat ──────────────────────────────────────────────────────────────────────
+
+@app.route('/api/chat', methods=['POST'])
+def chat():
+    if not ANTHROPIC_API_KEY:
+        return jsonify({'error': 'Configura tu API key de Anthropic en la variable de entorno ANTHROPIC_API_KEY'}), 400
+
+    try:
+        import anthropic
+        body = request.get_json()
+        mensaje = body.get('mensaje', '')
+        historial = body.get('historial', [])
+
+        data = load_kpis()
+        kpis_texto = json.dumps(data['kpis'], ensure_ascii=False, indent=2)
+
+        system_prompt = f"""Eres un asistente especializado en gestión comercial y KPIs para E-COMMERCE NETWORKS S.L.
+
+Datos reales de la empresa (enero 2025 - abril 2026):
+- Facturación total: 5.601.407 €
+- Cobrado: 4.996.606 € (89,2%)
+- Pendiente de cobro: 604.801 €
+- Por sector: RETAIL 3.453.241 €, EVENTOS 1.647.662 €, DECORACIÓN 475.006 €
+- Top clientes: WOZERE (812.988 €), INSTORE 360 (571.396 €), ORANGE (539.596 €), SUAREZ (394.612 €)
+- Win rate global de presupuestos: 60,5%
+- Total presupuestos: 1.385 (787 ganados, 514 rechazados, 84 en curso)
+- Valor pipeline activo: 23.183.748 €
+
+KPIs del departamento:
+{kpis_texto}
+
+Tu rol es:
+- Analizar facturación real y tendencias
+- Asesorar sobre los KPIs y proponer mejoras basadas en datos reales
+- Analizar el pipeline y win rate por comercial
+- Ayudar con distribución de presupuesto salarial
+- Identificar oportunidades de mejora y riesgos
+
+Responde siempre en español, de forma clara y concreta. Usa los datos reales para fundamentar tus respuestas."""
+
+        mensajes = []
+        for h in historial[-10:]:
+            mensajes.append({'role': h['role'], 'content': h['content']})
+        mensajes.append({'role': 'user', 'content': mensaje})
+
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model='claude-sonnet-4-6',
+            max_tokens=1024,
+            system=system_prompt,
+            messages=mensajes
+        )
+        return jsonify({'respuesta': response.content[0].text})
+
+    except ImportError:
+        return jsonify({'error': 'Instala la librería anthropic: pip install anthropic'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+def open_browser():
+    import time
+    time.sleep(1)
+    url = f'http://127.0.0.1:{APP_PORT}/ecom/kpiscomercial'
+    if sys.platform == 'darwin':
+        try:
+            subprocess.run(['open', url], check=False)
+            return
+        except Exception:
+            pass
+    webbrowser.open(url)
+
+
+if __name__ == '__main__':
+    threading.Thread(target=open_browser, daemon=True).start()
+    print(f'\nAgente Comercial iniciado en http://127.0.0.1:{APP_PORT}\n')
+    app.run(host='0.0.0.0', debug=False, port=APP_PORT)
